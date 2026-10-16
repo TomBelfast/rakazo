@@ -234,6 +234,18 @@ current provider, so **Link SSO** becomes available again. Link the new identity
 existing signed-in account; authenticated-session, verified-email and matching-email checks
 still apply. Restoring the old issuer makes its existing links usable again.
 
+Ordinary SSO sign-in and linking may reuse the identity provider's existing session. They
+do not grant fresh authentication proof for account deletion. The account settings' explicit
+reauthentication flow requests `prompt=login` and `max_age=0`, binds the callback to the
+same linked issuer and subject, and requires the initiating session to remain valid. Only
+that callback grants proof to the resulting session, expiring five minutes after provider
+authentication (callback delays do not extend it). Its verified
+ID token must contain an `auth_time` consistent with that request (allowing 60 seconds of
+clock skew) and less than five minutes old. Missing, stale or invalid claims fail closed.
+OAuth callbacks are single-use, including concurrent requests. Password verification and
+emailed deletion codes remain available. Submit deletion codes through the account settings
+or the CSRF-protected `POST /api/auth/delete-user` endpoint; the GET deletion callback is disabled.
+
 SSO signup follows closed registration and the deployment allowlist before creating an account.
 Allowlisted provider emails must be verified; the password signup's first-account exemption
 never upgrades an OIDC email. `OIDC_ALLOW_SIGNUP_BYPASS=true` explicitly admits IdP identities
@@ -251,7 +263,7 @@ on first use, refreshed in the background, and failures back off up to one minut
 reflects discovery, not a guarantee that the provider's token endpoint is currently reachable.
 
 Account deletion keeps the existing password confirmation for password users. Users without a
-password may delete after a provider sign-in within five minutes; **Sign in again** starts a fresh
+password may delete after explicit provider reauthentication within five minutes; **Sign in again** starts a fresh
 provider round-trip bound to the signed-in account. Choosing a different identity cannot confirm
 deletion or create another account in that flow. A stale or borrowed session alone cannot authorize deletion. With transactional
 email configured, **Send deletion code** sends a single-use code to the account email, valid for ten
@@ -293,6 +305,28 @@ metadata, never reset tokens. The inbox route is not registered in test, staging
 Billing stays off, with no paywall, unless `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and
 `STRIPE_PRICE_ID` are all set (see `.env.example`). Setting only some of them stops the API at
 startup.
+
+### Pi tracing
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` on the worker to enable optional OpenTelemetry traces
+(for example, `http://otel-collector:4318`). The OTLP/HTTP exporter appends `/v1/traces`
+to the base endpoint and honors standard `OTEL_EXPORTER_OTLP_HEADERS` (comma-separated
+`key=value` pairs) and `OTEL_SERVICE_NAME` (default `rakazo-worker`). Compose workers
+read these settings from `.env`. With an empty or unset endpoint, no tracing SDK loads
+or initializes. No collector or hosted service is required to run Rakazo.
+
+Traces contain a `rakazo.agent.run` span with `pi.ai.request` model-call spans and
+`pi.agent.tool` steps, including duration, token usage, cost when known, and success/error
+status. Each span carries `rakazo.bot.id`, `rakazo.run.id`, and `rakazo.routine.id`
+when the run belongs to a routine. Helper model calls inherit the same correlation.
+Pi 0.87.1 exposes built-in telemetry through its newer harness; Rakazo’s legacy Agent
+adapter maps its model and tool lifecycle through the same Pi telemetry contract.
+
+Prompt, response, tool arguments and tool results are excluded by default.
+`OTEL_CAPTURE_CONTENT=true` includes them: enable only with a trusted collector and
+appropriate retention/access controls, since this content can contain secrets or personal
+data. Unknown attributes and exception messages/stacks stay excluded. Export is batched,
+best effort, and flushed when the worker shuts down; collector failures do not fail runs.
 
 ### Logging
 
@@ -358,6 +392,22 @@ accepts images, enable **Supports images** under **Advanced** when connecting so
 screenshot computer tools stay available. Existing connections default to disabled. For centrally
 managed endpoints, the deployment-wide fallback remains
 `RAKAZO_OPENAI_COMPATIBLE_VISION_MODELS=gpt4o-vision,llava`.
+
+### Web search and page reading
+
+Builtin `web_search` and `web_fetch` use keyless HTTP search (DuckDuckGo HTML) and local
+Readability extraction by default. To choose [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp),
+set `WEB_PROVIDER=parallel` in `.env` and restart both the API and worker. The same bot tools
+then return search excerpts and extracted page markdown through HTTPS MCP at
+`https://search.parallel.ai/mcp`. Search uses Fast mode without an account or API key.
+
+This option sends search queries and requested page URLs to Parallel, which retrieves pages
+on its servers. Conversation accounting uses an HMAC of internal IDs keyed by
+`ENCRYPTION_KEY` (shared by the API and worker), so deployments with distinct secrets send
+distinct session IDs. Rotating that secret resets the session IDs; the existing development-only
+encryption-key fallback also applies here. Anonymous access has service limits; rate-limit and provider errors are returned
+to the bot without switching providers. Per-bot disabled web tools remain disabled. Set
+`WEB_PROVIDER=keyless-http` (or remove the setting) to return to the default.
 
 Remote MCP servers and installed API / GraphQL connectors default to public HTTPS. The deployment
 owner can attach one on localhost, the same LAN, or a Docker network. Set
@@ -861,3 +911,11 @@ The optional marketing site in `apps/www` can be hosted separately.
 ## Connect mobile clients
 
 The iOS and Android app can also point at a self-hosted origin at runtime. On the sign-in screen, tap **Use a custom server** and enter the same HTTPS origin as `WEB_ORIGIN` (for example `https://app.example.com`). Store builds still default to `EXPO_PUBLIC_API_URL`; the in-app setting is an override for people running their own API. Changing the server signs the device out of any previous session.
+
+## Upload size
+
+`MAX_UPLOAD_SIZE_MB` sets the per-file chat attachment and computer file transfer limit
+in MiB (1 MiB = 1,048,576 bytes). It defaults to `10` and must be a positive integer.
+Set it in `.env` and restart the API, worker, and Docker supervisor (when used). Web, desktop, and mobile use the
+limit advertised by the server. If a reverse proxy limits request bodies, allow
+room for base64 encoding (about 4/3 of the file size) and the JSON envelope.
